@@ -73,14 +73,16 @@
 <div class="wrap">
   <div class="logo"><div class="dot"></div><h1>Jellyfin → Stremio</h1><button id="logoutBtn" class="btn small danger" style="margin-left:auto">Lock</button></div>
   <p class="subtitle">
-    Each Jellyfin setup gets its own random link — like Torrentio. Enter your server details, generate the link,
-    and install it in Stremio/Nuvio. Different servers/user setups = different links, all served by this one process.
-    <br><strong style="color:var(--accent2)">Don't share your install link</strong> — it contains your server URL and API key.
+    Each Jellyfin setup gets a unique install link. Enter the server details and install the link in Stremio.
+    Different configurations use different links, all served by this addon.
+    <br><strong style="color:var(--accent2)">Treat install links as credentials.</strong> Anyone with a link can recover the server URL and API key.
     If friends want in, point them to the <a href="/configure" style="color:var(--accent)">public configure page</a> where they add their own Jellyfin.
   </p>
 
+  <div class="meta" style="margin:0 0 18px">The first listed Jellyfin setup is the default for <code>/manifest.json</code>. Its catalog and streams use the same default setup. To change the default, remove the first saved setup or change the environment configuration.</div>
+
   <div id="envBanner" class="banner hide">
-    Environment variables (<code>JELLYFIN_URL</code> / <code>JELLYFIN_API_KEY</code>) are set and take precedence at boot.
+    The first setup comes from <code>JELLYFIN_URL</code> and <code>JELLYFIN_API_KEY</code>. To edit or remove it, change those variables and restart the addon.
   </div>
 
   <div id="configs"></div>
@@ -92,7 +94,7 @@
       <input type="text" id="name" placeholder="e.g. Home server" autocomplete="off" spellcheck="false">
 
       <label for="url">Jellyfin instance URL</label>
-      <input type="text" id="url" placeholder="http://192.168.1.100:8096 or https://media.example.com" autocomplete="off" spellcheck="false">
+      <input type="text" id="url" placeholder="http://jellyfin-host:8096 or https://media.example.com" autocomplete="off" spellcheck="false">
 
       <label for="key">API key</label>
       <input type="password" id="key" placeholder="Paste your Jellyfin API key" autocomplete="off">
@@ -142,6 +144,7 @@ function installRow(url, copyLabel) {
 
 async function render() {
   const s = await api('/api/status');
+  if (s._unauthorized) return;
   $('envBanner').classList.toggle('hide', !s.envOverrides);
   const box = $('configs');
   box.innerHTML = '';
@@ -156,18 +159,20 @@ async function render() {
       : { cls: 'off', text: 'Unreachable: ' + ((cfg.jellyfin && cfg.jellyfin.error) || 'no connection') };
     const card = document.createElement('div');
     card.className = 'card';
+    const defaultTag = cfg.isDefault ? '<span class="tag" style="margin-left:8px;color:var(--accent2)">DEFAULT</span>' : '';
+    const defaultLink = cfg.isDefault ? '<label>Simple Stremio install link (default)</label>' + installRow(cfg.defaultInstallUrl) : '';
     let legacy = '';
     if (cfg.legacyInstallUrl) legacy = `<div class="meta" style="margin-top:10px">Legacy URL: ${esc(cfg.legacyInstallUrl)}</div>`;
     card.innerHTML = `
-      <p style="font-size:15px;font-weight:700;">${esc(cfg.name || 'Jellyfin')} <span class="tag" style="float:right">${esc(cfg.token.slice(0, 12))}…</span></p>
+      <p style="font-size:15px;font-weight:700;">${esc(cfg.name || 'Jellyfin')}${defaultTag} <span class="tag" style="float:right">${esc(cfg.token.slice(0, 12))}…</span></p>
       <div class="status-row"><span class="pulse ${st.cls}"></span><span>${esc(st.text)}</span></div>
       <div class="meta">Jellyfin server: ${esc(cfg.url || 'not set')}</div>
-      <label>Install link (personal — do not share)</label>
+      <label>Install link (contains encoded credentials)</label>
       ${installRow(cfg.installUrl)}
+      ${defaultLink}
       ${legacy}
       <div class="btn-row">
-        <button class="btn small ghost" data-edit="${esc(cfg.token)}">Edit</button>
-        <button class="btn small danger" data-del="${esc(cfg.token)}">Remove</button>
+        ${cfg.envManaged ? '<span class="tag">Managed by environment</span>' : `<button class="btn small ghost" data-edit="${esc(cfg.token)}">Edit</button><button class="btn small danger" data-del="${esc(cfg.token)}">Remove</button>`}
         <button class="btn small" data-share style="margin-left:auto">Share with someone</button>
       </div>`;
     box.appendChild(card);
@@ -242,8 +247,8 @@ $('form').addEventListener('submit', async (e) => {
     const res = await api(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (res.ok) {
       showResult(true, res.jellyfin && res.jellyfin.ok
-        ? 'Connected to Jellyfin ' + res.jellyfin.version + '. Install this new link:'
-        : 'Saved, but could not reach Jellyfin: ' + ((res.jellyfin && res.jellyfin.error) || 'unknown error') + '. Link:');
+        ? 'Saved. Connected to Jellyfin ' + res.jellyfin.version + '. Copy the install link from the list above.'
+        : 'Saved, but Jellyfin is unreachable: ' + ((res.jellyfin && res.jellyfin.error) || 'unknown error') + '. Check the setup above.');
       await render();
     } else {
       showResult(false, res.error || 'Could not save.');

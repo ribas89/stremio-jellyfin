@@ -64,21 +64,18 @@
 <body>
 <div class="wrap">
   <div class="logo"><div class="dot"></div><h1>Connect your Jellyfin</h1></div>
-  <p class="subtitle">This server turns your own Jellyfin library into a Stremio addon. Your server details go into a private install link — they are only ever yours.</p>
+  <p class="subtitle">This server generates a Stremio install link for your Jellyfin library. The link contains your server address and API key in encoded form.</p>
 
   <div class="steps">
     <div class="step"><div class="n">1</div><div class="t">Enter your Jellyfin details below</div></div>
     <div class="step"><div class="n">2</div><div class="t">Copy your private install link</div></div>
-    <div class="step"><div class="n">3</div><div class="t">Open it in Stremio / Nuvio</div></div>
+    <div class="step"><div class="n">3</div><div class="t">Open it in Stremio</div></div>
   </div>
 
   <div class="card">
     <form id="form">
-      <label for="name">Name (optional)</label>
-      <input type="text" id="name" placeholder="e.g. Home server" autocomplete="off" spellcheck="false">
-
       <label for="url">Jellyfin instance URL</label>
-      <input type="text" id="url" placeholder="http://192.168.1.100:8096 or https://media.example.com" autocomplete="off" spellcheck="false">
+      <input type="text" id="url" placeholder="http://jellyfin-host:8096 or https://media.example.com" autocomplete="off" spellcheck="false">
 
       <label for="key">API key</label>
       <input type="password" id="key" placeholder="Paste your Jellyfin API key" autocomplete="off">
@@ -91,8 +88,8 @@
     </form>
   </div>
 
-  <p class="privacy">Your URL and API key are never sent to anyone else — they are only embedded in your own install link.<br>
-  <span class="priv">Don't share your install link</span> — it grants access to your Jellyfin library.</p>
+  <p class="privacy">This addon host receives your details to check the connection. The generated link contains encoded credentials, not encrypted ones.
+  <span class="priv">Treat the link as a password.</span> Anyone with it can recover the API key and access your Jellyfin library.</p>
 </div>
 
 <script>
@@ -124,7 +121,6 @@ $('form').addEventListener('submit', async (e) => {
 
   const jellyfinUrl = $('url').value.trim();
   const jellyfinApiKey = $('key').value.trim();
-  const name = $('name').value.trim();
 
   try {
     const res = await fetch('/api/check', {
@@ -140,11 +136,12 @@ $('form').addEventListener('submit', async (e) => {
       return;
     }
 
-    const config = { jellyfinUrl, jellyfinApiKey };
-    if (name) config.name = name;
-    const installUrl = location.origin + '/' + encodeURIComponent(JSON.stringify(config)) + '/manifest.json';
+    const config = { jellyfinUrl: jellyfinUrl.replace(/\/+$/, ''), jellyfinApiKey };
+    const binary = Array.from(new TextEncoder().encode(JSON.stringify(config)), (b) => String.fromCharCode(b)).join('');
+    const token = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const installUrl = location.origin + '/' + token + '/manifest.json';
     showResult(true,
-      'Connected to Jellyfin ' + esc(data.version) + '! Install this link in Stremio / Nuvio:' +
+      'Connected to Jellyfin ' + esc(data.version) + '! Install this link in Stremio:' +
       '<div class="install-url"><code>' + esc(installUrl) + '</code><button class="copy" type="button">Copy</button></div>');
     const copy = $('result').querySelector('.copy');
     if (copy) copy.addEventListener('click', () => copyText(installUrl, copy));

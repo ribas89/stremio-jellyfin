@@ -11,20 +11,38 @@ class JellyfinClient {
     this.externalIdIndex = null;
     this.externalIdIndexAt = 0;
     this.headers = {
-      'X-Emby-Token': apiKey,
+      // Modern Jellyfin (10.11+/12+) requires the token in Authorization.
+      // The legacy X-Emby-Token header is rejected by newer servers.
       Authorization:
-        'MediaBrowser Client="stremio-jellyfin", Device="stremio", DeviceId="stremio-jellyfin", Version="1.0.0"',
+        `MediaBrowser Token="${apiKey}", Client="stremio-jellyfin", Device="stremio", DeviceId="stremio-jellyfin", Version="1.0.0"`,
       Accept: 'application/json',
     };
   }
 
   async get(path, params = {}) {
     const qs = new URLSearchParams(params);
-    const res = await fetch(`${this.baseUrl}${path}?${qs.toString()}`, { headers: this.headers });
+    const url = `${this.baseUrl}${path}${qs.size ? `?${qs}` : ''}`;
+    const res = await fetch(url, { headers: this.headers });
+    const contentType = res.headers.get('content-type') || 'unknown';
+    // Do not include the request query or Authorization header in logs.
+    // Login pages and proxy challenge pages may still return HTTP 200.
+    const upstreamPath = (() => {
+      try { return new URL(res.url).pathname; } catch { return '(unknown)'; }
+    })();
+    const redirectedTo = res.redirected ? `; redirected to ${upstreamPath}` : '';
     if (!res.ok) {
-      throw new Error(`Jellyfin ${path} -> ${res.status} ${res.statusText}`);
+      throw new Error(`Jellyfin ${path} -> HTTP ${res.status} ${res.statusText} (content-type: ${contentType}${redirectedTo})`);
     }
-    return res.json();
+    const body = await res.text();
+    try {
+      return JSON.parse(body);
+    } catch {
+      const htmlTitle = /<title[^>]*>([^<]*)<\/title>/i.exec(body)?.[1]?.trim().slice(0, 100);
+      const html = /^\s*(?:<!doctype html|<html|<head|<body)/i.test(body);
+      const kind = html ? 'HTML instead of JSON' : 'invalid JSON';
+      const details = htmlTitle ? `; page title: ${JSON.stringify(htmlTitle)}` : '';
+      throw new Error(`Jellyfin ${path} returned ${kind} (HTTP ${res.status}; content-type: ${contentType}; path: ${upstreamPath}${redirectedTo}${details}). Check the Jellyfin base URL, reverse proxy, login redirects, and Cloudflare/access rules.`);
+    }
   }
 
   async ping() {
@@ -90,7 +108,7 @@ class JellyfinClient {
 
   // Resolve a Stremio id to a Jellyfin item. Stremio ids may be Jellyfin
   // GUIDs (from our catalogs) or IMDb ids (from Cinemeta-style catalogs,
-  // e.g. "tt0848228" or "tt0903747:1:1" for episodes).
+  // e.g. "tt0000001" or "tt0000002:1:1" for episodes).
   async resolveItem(id, type) {
     if (/^[0-9a-f]{32}$/i.test(id)) {
       return this.getItem(id);
@@ -165,19 +183,33 @@ class JellyfinClient {
     return this.userId ? `/Users/${this.userId}/Items` : '/Items';
   }
 
-  streamUrl(itemId) {
-    const qs = new URLSearchParams({ api_key: this.apiKey });
-    if (this.streamMode === 'auto') {
+  // A bare /Videos/{id}/stream URL gives some third-party players too little
+  // information about the media file. Preserve the source container and media
+  // source ID so a player can identify finite VOD and request byte ranges.
+  // IMPORTANT: A *static* stream is required for byte-accurate seeking. A
+  // progressive (Static=false) FFmpeg stream may not have a known total size.
+  streamUrl(itemId, source = null, { transcode = false } = {}) {
+    const qs = new URLSearchParams({ ApiKey: this.apiKey });
+    let extension = '';
+    if (transcode) {
       qs.set('Static', 'false');
       qs.set('TranscodeReasons', 'ContainerNotSupported,VideoCodecNotSupported,AudioCodecNotSupported');
     } else {
       qs.set('Static', 'true');
+      // Jellyfin documents that the original container or no extension is
+      // valid for Static=true. Never invent a format if Jellyfin lacks it.
+      const aliases = { matroska: 'mkv', mpegts: 'ts', quicktime: 'mov' };
+      const raw = String((source && source.Container) || '').toLowerCase();
+      const normalized = aliases[raw] || raw;
+      const formats = new Set(['mp4', 'm4v', 'mkv', 'webm', 'ts', 'avi', 'mov', 'mpeg', 'mpg', 'wmv', 'asf', 'ogv', 'flv', 'm2ts', '3gp', 'wtv', 'iso']);
+      if (formats.has(normalized)) extension = `.${normalized}`;
     }
-    return `${this.baseUrl}/Videos/${itemId}/stream?${qs.toString()}`;
+    if (source && source.Id) qs.set('MediaSourceId', String(source.Id));
+    return `${this.baseUrl}/Videos/${encodeURIComponent(itemId)}/stream${extension}?${qs.toString()}`;
   }
 
   imageUrl(itemId, type = 'Primary') {
-    return `${this.baseUrl}/Items/${itemId}/Images/${type}?api_key=${encodeURIComponent(this.apiKey)}`;
+    return `${this.baseUrl}/Items/${itemId}/Images/${type}?ApiKey=${encodeURIComponent(this.apiKey)}`;
   }
 
   image(itemId, type = 'Primary') {

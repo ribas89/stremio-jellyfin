@@ -13,11 +13,11 @@ services:
       - CONFIG_PATH=/app/config/config.json
       # Password for the /manage page and setup APIs (recommended for any
       # public deployment). Generate one with: openssl rand -hex 16
-      - MANAGE_KEY=change-me
+      - MANAGE_KEY=${MANAGE_KEY:?Set MANAGE_KEY in .env}
       # Optional: bootstrap a single Jellyfin setup from environment variables
       # instead of the web UI (takes precedence over config.json at boot).
-      # - JELLYFIN_URL=https://media.example.com
-      # - JELLYFIN_API_KEY=your-jellyfin-api-key
+      # - JELLYFIN_URL=${JELLYFIN_URL}
+      # - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
     volumes:
       - config_data:/app/config
 

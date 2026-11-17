@@ -12,14 +12,17 @@ const configPath = process.env.CONFIG_PATH || path.join(__dirname, 'config.json'
 
 function loadConfigFile() {
   try {
-    return require(configPath);
-  } catch {
-    return {};
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return {};
+    throw err;
   }
 }
 
 function writeConfigFile(obj) {
-  fs.writeFileSync(configPath, JSON.stringify(obj, null, 2) + '\n');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(obj, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(configPath, 0o600);
 }
 
 const fileConfig = loadConfigFile();
@@ -28,7 +31,10 @@ const STREAM_MODE = fileConfig.streamMode || 'direct';
 const PAGE_SIZE = Number(fileConfig.pageSize || 20);
 const CACHE_TTL = Number(fileConfig.cacheTtl || 300);
 const MANAGE_KEY = process.env.MANAGE_KEY || fileConfig.manageKey || '';
-const envOverrides = !!process.env.JELLYFIN_URL || !!process.env.JELLYFIN_API_KEY;
+const envOverrides = !!(process.env.JELLYFIN_URL && process.env.JELLYFIN_API_KEY);
+if (!!process.env.JELLYFIN_URL !== !!process.env.JELLYFIN_API_KEY) {
+  throw new Error('Set both JELLYFIN_URL and JELLYFIN_API_KEY or neither.');
+}
 
 const isPlaceholder = (value) => /YOUR|PASTE_/.test(value);
 
@@ -82,30 +88,64 @@ function loadConfigs() {
     const token = tokenFor(c);
     if (!out.some((x) => x.token === token)) out.push({ ...c, token });
   };
+
+  // Once Manage has saved a list, its order is authoritative. In particular,
+  // a deleted/edited first setup must not reappear from legacy config fields
+  // after a restart (an empty savedConfigs array also means no setups).
+  if (Array.isArray(fileConfig.savedConfigs)) {
+    for (const s of fileConfig.savedConfigs) {
+      push({ name: s.name, jellyfinUrl: s.jellyfinUrl, jellyfinApiKey: s.jellyfinApiKey, legacyId: s.legacyId });
+    }
+    return out;
+  }
+
+  // Backward compatible initial import for older config.json formats.
   if (fileConfig.jellyfinUrl && fileConfig.jellyfinApiKey) {
     push({ name: 'My Jellyfin', jellyfinUrl: fileConfig.jellyfinUrl, jellyfinApiKey: fileConfig.jellyfinApiKey });
   }
   for (const inst of Array.isArray(fileConfig.instances) ? fileConfig.instances : []) {
     push({ name: inst.name, jellyfinUrl: inst.jellyfinUrl, jellyfinApiKey: inst.jellyfinApiKey, legacyId: inst.id });
   }
-  for (const s of Array.isArray(fileConfig.savedConfigs) ? fileConfig.savedConfigs : []) {
-    push({ name: s.name, jellyfinUrl: s.jellyfinUrl, jellyfinApiKey: s.jellyfinApiKey, legacyId: s.legacyId });
-  }
   return out;
 }
 
 let configs = loadConfigs();
+if (envOverrides) {
+  const envConfig = {
+    name: 'Environment setup',
+    jellyfinUrl: process.env.JELLYFIN_URL.trim().replace(/\/+$/, ''),
+    jellyfinApiKey: process.env.JELLYFIN_API_KEY.trim(),
+    envManaged: true,
+  };
+  if (!isConfigured(envConfig) || !/^https?:\/\//i.test(envConfig.jellyfinUrl)) {
+    throw new Error('Invalid JELLYFIN_URL or JELLYFIN_API_KEY.');
+  }
+  envConfig.token = tokenFor(envConfig);
+  configs = [envConfig, ...configs.filter((c) => c.token !== envConfig.token)];
+}
 
 function persistConfigs() {
-  writeConfigFile({
+  // Environment-managed credentials remain in the environment, not config.json.
+  const stored = configs.filter((c) => !c.envManaged);
+  const next = {
     ...loadConfigFile(),
     port: PORT,
     streamMode: STREAM_MODE,
     pageSize: PAGE_SIZE,
     cacheTtl: CACHE_TTL,
-    instances: configs.filter((c) => c.legacyId).map((c) => ({ id: c.legacyId, name: c.name, jellyfinUrl: c.jellyfinUrl, jellyfinApiKey: c.jellyfinApiKey })),
-    savedConfigs: configs.map((c) => ({ name: c.name, jellyfinUrl: c.jellyfinUrl, jellyfinApiKey: c.jellyfinApiKey })),
-  });
+    // Preserve legacy /i/:id links when migrating to the ordered saved list.
+    instances: stored.filter((c) => c.legacyId).map((c) => ({ id: c.legacyId, name: c.name, jellyfinUrl: c.jellyfinUrl, jellyfinApiKey: c.jellyfinApiKey })),
+    savedConfigs: stored.map((c) => ({
+      name: c.name,
+      jellyfinUrl: c.jellyfinUrl,
+      jellyfinApiKey: c.jellyfinApiKey,
+      ...(c.legacyId ? { legacyId: c.legacyId } : {}),
+    })),
+  };
+  // A migrated config should have a single authoritative source of setups.
+  delete next.jellyfinUrl;
+  delete next.jellyfinApiKey;
+  writeConfigFile(next);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +235,7 @@ function streamCard(item, source) {
   const year = item && item.ProductionYear ? String(item.ProductionYear) : '';
   let name = movieName ? (year ? `${movieName} (${year})` : movieName) : null;
 
-  // Episodes get a S01E01 label too (e.g. "Panchayat S01E01").
+  // Episodes get a S01E01 label too (e.g. "Example Show S01E01").
   const isEpisode = item && (item.Type === 'Episode' || (item.ParentIndexNumber && item.IndexNumber));
   if (isEpisode && movieName) {
     const season = item.ParentIndexNumber != null ? String(item.ParentIndexNumber).padStart(2, '0') : '';
@@ -234,22 +274,23 @@ function buildAddon({ jellyfinUrl, jellyfinApiKey, name, token, stubId, legacyId
   const img = (itemId, type) => `/img/${token}/${itemId}/${type}`;
 
   const manifest = {
-    id: `community.nuvio-jellyfin.${stubId}`,
+    id: `community.stremio-jellyfin.${stubId}`,
     version: '1.0.0',
     name: name ? `Jellyfin: ${name}` : 'Jellyfin',
-    description: `Movies and TV shows from ${jellyfinUrl}`,
+    description: 'Movies and TV shows from a self-hosted Jellyfin library',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series'],
     catalogs: [
-      { type: 'movie', id: 'jfmovies', name: 'Jellyfin Movies' },
-      { type: 'series', id: 'jfshows', name: 'Jellyfin Shows' },
+      { type: 'movie', id: 'jfmovies', name: 'Jellyfin Movies', extra: [
+        { name: 'search', isRequired: false }, { name: 'skip', isRequired: false }, { name: 'genre', isRequired: false },
+      ] },
+      { type: 'series', id: 'jfshows', name: 'Jellyfin Shows', extra: [
+        { name: 'search', isRequired: false }, { name: 'skip', isRequired: false }, { name: 'genre', isRequired: false },
+      ] },
       { type: 'genre', id: 'jfgenres', name: 'Jellyfin Genres' },
     ],
-    config: [
-      { key: 'jellyfinUrl', type: 'text', title: 'Jellyfin instance URL' },
-      { key: 'jellyfinApiKey', type: 'password', title: 'Jellyfin API key' },
-    ],
-    behaviorHints: { configurable: true },
+    config: [],
+    behaviorHints: { configurable: false },
   };
 
   const addon = new addonBuilder(manifest);
@@ -331,22 +372,58 @@ function buildAddon({ jellyfinUrl, jellyfinApiKey, name, token, stubId, legacyId
       }
       const source = item.MediaSources && item.MediaSources[0];
       const card = streamCard(item, source);
+
+      // Always present the original finite media file FIRST, even if the
+      // optional auto/transcode mode is enabled. Progressive FFmpeg streams
+      // commonly appear as live media (unknown total time, no seeking).
       const stream = {
-        name: (card && card.title) || (STREAM_MODE === 'auto' ? 'Jellyfin (auto)' : 'Jellyfin'),
-        url: client.streamUrl(item.Id),
+        name: (card && card.title) || 'Jellyfin • Original (seekable)',
+        url: client.streamUrl(item.Id, source),
       };
       if (card) stream.description = card.description;
-      return {
-        streams: [stream],
-        cacheMaxAge: 0,
-      };
+      const hints = {};
+      if (source && Number.isSafeInteger(source.Size) && source.Size > 0) {
+        hints.videoSize = source.Size;
+      }
+      if (source && (source.Path || source.Name)) {
+        hints.filename = String(source.Path || source.Name).split(/[\\/]/).pop();
+      }
+      // Advertise the real container. Non-MP4 media should use a native
+      // player rather than being misclassified as browser-ready MP4.
+      if (source && String(source.Container || '').toLowerCase() !== 'mp4') {
+        hints.notWebReady = true;
+      }
+      if (Object.keys(hints).length) stream.behaviorHints = hints;
+
+      const streams = [stream];
+      // The legacy extensionless URL was playable in some desktop setups.
+      // Keep it as a separate compatibility option for non-MP4 sources.
+      if (source && String(source.Container || '').toLowerCase() !== 'mp4') {
+        const legacy = {
+          name: 'Jellyfin desktop compatibility',
+          url: client.streamUrl(item.Id),
+        };
+        const legacyHints = {};
+        if (hints.filename) legacyHints.filename = hints.filename;
+        if (hints.videoSize) legacyHints.videoSize = hints.videoSize;
+        if (Object.keys(legacyHints).length) legacy.behaviorHints = legacyHints;
+        streams.push(legacy);
+      }
+      if (STREAM_MODE === 'auto') {
+        streams.push({
+          name: 'Jellyfin fallback',
+          url: client.streamUrl(item.Id, source, { transcode: true }),
+          behaviorHints: { notWebReady: true },
+        });
+      }
+      return { streams, cacheMaxAge: 0 };
     } catch (err) {
       console.error(`[stream:${stubId}]`, err.message);
       return { streams: [], cacheMaxAge: 0 };
     }
   });
 
-  return { client, router: getRouter(addon.getInterface()), token, legacyId, name, jellyfinApiKey };
+  return { client, router: getRouter(addon.getInterface()), manifest, token, legacyId, name, jellyfinApiKey };
 }
 
 // Resolve a token (or legacy instance id) to a built addon entry.
@@ -381,10 +458,21 @@ function rebuild() {
 }
 
 function findEntry(value) {
-  return byToken.get(value) || byLegacy.get(value) || (() => {
-    const cfg = decodeToken(value);
-    return cfg ? ensureConfig(cfg) : null;
-  })();
+  const saved = byToken.get(value) || byLegacy.get(value);
+  if (saved) return saved;
+  const cfg = decodeToken(value);
+  if (!cfg) return null;
+  // Ad hoc public links are handled without registering credentials in memory.
+  const token = tokenFor(cfg);
+  return buildAddon({ ...cfg, token, stubId: stubIdFor(token) });
+}
+
+// The tokenless Stremio endpoint uses the first configured setup
+// (same order as /manage). It is not affected by visitors who open a
+// self-contained /<token>/manifest.json install link.
+function firstSavedEntry() {
+  const first = configs[0];
+  return first ? byToken.get(first.token) || null : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -394,9 +482,13 @@ function findEntry(value) {
 const app = express();
 app.use(express.json());
 
-// Request log so we can see exactly what Nuvio/Stremio is asking for.
+// Log incoming requests without including credential-bearing install tokens.
 app.use((req, res, next) => {
-  console.log(`[req] ${req.method} ${req.path}`);
+  // Install URLs encode API keys in the URL path: redact them in access logs.
+  const safePath = req.path
+    .replace(/^\/img\/[^/]+(?=\/|$)/, '/img/[token]')
+    .replace(/\/[^/]{24,}(?=\/|$)/g, '/[token]');
+  console.log(`[req] ${req.method} ${safePath}`);
   next();
 });
 
@@ -409,7 +501,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const baseUrl = (req) => `http://${req.headers.host}`;
+const baseUrl = (req) => `${(req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim()}://${req.headers.host}`;
 const tokenInstallUrl = (req, token) => `${baseUrl(req)}/${token}/manifest.json`;
 const legacyInstallUrl = (req, id) => `${baseUrl(req)}/i/${id}/manifest.json`;
 
@@ -423,14 +515,10 @@ async function checkClient(client) {
 }
 
 async function allStatus(req) {
-  const seen = new Set();
   const list = [];
-  for (const entry of byToken.values()) {
-    const token = tokenFor({ jellyfinUrl: entry.client.baseUrl, jellyfinApiKey: entry.jellyfinApiKey });
-    if (seen.has(token)) continue;
-    seen.add(token);
-    const saved = configs.find((c) => c.token === token);
-    list.push(await statusOfToken(req, token, entry, saved));
+  for (const saved of configs) {
+    const entry = byToken.get(saved.token);
+    if (entry) list.push(await statusOfToken(req, saved.token, entry, saved));
   }
   return list;
 }
@@ -445,6 +533,9 @@ async function statusOfToken(req, token, entry, saved) {
     jellyfin,
     installUrl: tokenInstallUrl(req, token),
     legacyInstallUrl: entry && entry.legacyId ? legacyInstallUrl(req, entry.legacyId) : null,
+    envManaged: !!(saved && saved.envManaged),
+    isDefault: !!(saved && configs.length && saved.token === configs[0].token),
+    defaultInstallUrl: saved && configs.length && saved.token === configs[0].token ? `${baseUrl(req)}/manifest.json` : null,
   };
 }
 
@@ -453,7 +544,7 @@ async function statusOfToken(req, token, entry, saved) {
 // stay in the URL. MANAGE_KEY (env or config.json) is the password.
 // ---------------------------------------------------------------------------
 
-const MANAGE_COOKIE = 'nuviojf_manage';
+const MANAGE_COOKIE = 'stremio_jellyfin_manage';
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 
 function keyMatches(given) {
@@ -495,7 +586,8 @@ function manageGate(req, res, next) {
 app.post('/api/login', (req, res) => {
   if (!MANAGE_KEY) return res.json({ ok: true });
   if (keyMatches(req.body && req.body.key)) {
-    res.setHeader('Set-Cookie', `${MANAGE_COOKIE}=${sha256(MANAGE_KEY)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000`);
+    const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+    res.setHeader('Set-Cookie', `${MANAGE_COOKIE}=${sha256(MANAGE_KEY)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000${secure ? '; Secure' : ''}`);
     return res.json({ ok: true });
   }
   return res.status(401).json({ ok: false, error: 'Wrong key' });
@@ -567,13 +659,16 @@ app.post('/api/configs', manageGate, async (req, res) => {
 app.put('/api/configs/:token', manageGate, async (req, res) => {
   const idx = configs.findIndex((c) => c.token === req.params.token);
   if (idx === -1) return res.status(404).json({ ok: false, error: 'Config not found' });
+  if (configs[idx].envManaged) return res.status(409).json({ ok: false, error: 'Change the environment variables to edit this setup.' });
 
-  const valid = validateCredentials(req.body || {});
+  const existingKey = configs[idx].jellyfinApiKey;
+  const valid = validateCredentials({ ...(req.body || {}), jellyfinApiKey: (req.body && req.body.jellyfinApiKey) || existingKey });
   if (valid.error) return res.status(400).json({ ok: false, error: valid.error });
 
   const old = configs[idx];
   const config = { name: String((req.body.name !== undefined && req.body.name) || old.name || '').trim().slice(0, 40) || 'Jellyfin', jellyfinUrl: valid.jellyfinUrl, jellyfinApiKey: valid.jellyfinApiKey };
   configs[idx] = { ...config, token: tokenFor(config), legacyId: old.legacyId };
+  persistConfigs();
   rebuild();
 
   const entry = byToken.get(configs[idx].token);
@@ -584,6 +679,7 @@ app.put('/api/configs/:token', manageGate, async (req, res) => {
 app.delete('/api/configs/:token', manageGate, async (req, res) => {
   const idx = configs.findIndex((c) => c.token === req.params.token);
   if (idx === -1) return res.status(404).json({ ok: false, error: 'Config not found' });
+  if (configs[idx].envManaged) return res.status(409).json({ ok: false, error: 'Unset environment variables to remove this setup.' });
   configs.splice(idx, 1);
   persistConfigs();
   rebuild();
@@ -602,11 +698,13 @@ app.post('/api/config', manageGate, async (req, res) => {
     const entry = byToken.get(config.token);
     return res.json({ ok: true, instance: { name: config.name, jellyfin: await checkClient(entry.client), installUrl: tokenInstallUrl(req, config.token) } });
   }
-  const target = configs.find((c) => c.token === req.body.token) || configs[0];
+  const target = configs.find((c) => c.token === (req.body || {}).token && !c.envManaged) || configs.find((c) => !c.envManaged);
+  if (!target) return res.status(409).json({ ok: false, error: 'Change environment variables to edit the environment setup.' });
   const valid = validateCredentials(req.body || {});
   if (valid.error) return res.status(400).json({ ok: false, error: valid.error });
   const config = { name: target.name, jellyfinUrl: valid.jellyfinUrl, jellyfinApiKey: valid.jellyfinApiKey };
   Object.assign(target, config, { token: tokenFor(config) });
+  persistConfigs();
   rebuild();
   const entry = byToken.get(target.token);
   res.json({ ok: true, instance: { name: target.name, jellyfin: await checkClient(entry.client), installUrl: tokenInstallUrl(req, target.token) } });
@@ -615,7 +713,8 @@ app.post('/api/config', manageGate, async (req, res) => {
 app.get('/health', async (req, res) => {
   const list = await allStatus(req);
   const allUp = list.length > 0 && list.every((i) => i.jellyfin.ok);
-  res.status(allUp ? 200 : 503).json({ ok: allUp, configs: list });
+  // Do not expose install URLs: tokens encode the Jellyfin API key.
+  res.status(allUp ? 200 : 503).json({ ok: allUp, configured: list.length });
 });
 
 // Image proxy. Metas reference /img/<token>/<itemId>/<type>.
@@ -635,6 +734,31 @@ app.get('/img/:token/:itemId/:type', async (req, res) => {
   }
 });
 
+// A clean, tokenless Stremio install URL for the first saved Jellyfin setup.
+// Keep the manifest NON-configurable: Stremio should not send someone installing
+// this default endpoint to the unrelated public /configure form.
+// The configured Jellyfin URL and API key are never included in this JSON.
+app.get('/manifest.json', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const entry = firstSavedEntry();
+  if (!entry) return res.status(503).json({ error: 'No default Jellyfin setup. Add one at /manage.' });
+  const manifest = entry.manifest;
+  res.json({
+    ...manifest,
+    config: [],
+    behaviorHints: { ...(manifest.behaviorHints || {}), configurable: false },
+  });
+});
+
+// A manifest alone is not enough: Stremio requests catalogs, metadata and
+// streams at the same base URL. Forward those routes to that SAME default addon.
+app.use((req, res, next) => {
+  if (!/^\/(catalog|meta|stream)(?:\/|$)/.test(req.path)) return next();
+  const entry = firstSavedEntry();
+  if (!entry) return res.status(503).json({ error: 'No default Jellyfin setup. Add one at /manage.' });
+  return entry.router(req, res, next);
+});
+
 // Legacy /i/<id>/... URLs (kept so older installs still work).
 app.use('/i/:legacyId', (req, res, next) => {
   const entry = byLegacy.get(req.params.legacyId);
@@ -648,7 +772,7 @@ app.get('/configure', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'configure.html'));
 });
 
-// Manage page (owner only). The list of all setups lives here — every other
+// Manage page (owner only). The list of all setups lives here: every other
 // entry point is per-user and shows nothing about the other setups.
 app.get('/manage', manageGate, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -669,16 +793,17 @@ app.use('/:token', (req, res, next) => {
   return entry.router(req, res, next);
 });
 
-// Neutral landing: points visitors to the configure flow, leaks nothing.
+// Default landing: show the protected manage page. Unauthenticated visitors
+// will see its login screen when MANAGE_KEY is configured.
 app.get('/', (req, res) => {
-  res.redirect('/configure');
+  res.redirect('/manage');
 });
 
 rebuild();
 app.listen(PORT, () => {
-  console.log(`Addon running: http://localhost:${PORT} — manage page: http://localhost:${PORT}/manage`);
+  console.log(`Addon running on port ${PORT}; manage page: http://localhost:${PORT}/manage`);
   for (const c of configs) {
-    console.log(`  "${c.name}": http://localhost:${PORT}/${c.token}/manifest.json`);
+    console.log(`  Jellyfin config loaded: "${c.name}"`);
   }
   for (const entry of byToken.values()) {
     entry.client.resolveUser().catch(() => {});
